@@ -8,8 +8,7 @@
 
 , perlPackages
 
-, nix
-, nix-perl-bindings
+, nixComponents
 , git
 
 , makeWrapper
@@ -50,6 +49,7 @@
 , xz
 , gnutar
 , gnused
+, nix-eval-jobs
 
 , rpm
 , dpkg
@@ -61,7 +61,7 @@ let
     name = "hydra-perl-deps";
     paths = lib.closePropagation
       ([
-        nix-perl-bindings
+        nixComponents.nix-perl-bindings
         git
       ] ++ (with perlPackages; [
         AuthenSASL
@@ -89,6 +89,7 @@ let
         DateTime
         DBDPg
         DBDSQLite
+        DBIxClassHelpers
         DigestSHA1
         EmailMIME
         EmailSender
@@ -161,7 +162,7 @@ stdenv.mkDerivation (finalAttrs: {
     nukeReferences
     pkg-config
     mdbook
-    nix
+    nixComponents.nix-cli
     perlDeps
     perl
     unzip
@@ -171,7 +172,9 @@ stdenv.mkDerivation (finalAttrs: {
     libpqxx
     openssl
     libxslt
-    nix
+    nixComponents.nix-util
+    nixComponents.nix-store
+    nixComponents.nix-main
     perlDeps
     perl
     boost
@@ -190,6 +193,7 @@ stdenv.mkDerivation (finalAttrs: {
     openldap
     postgresql_13
     pixz
+    nix-eval-jobs
   ];
 
   checkInputs = [
@@ -197,13 +201,14 @@ stdenv.mkDerivation (finalAttrs: {
     glibcLocales
     libressl.nc
     python3
+    nixComponents.nix-cli
   ];
 
   hydraPath = lib.makeBinPath (
     [
       subversion
       openssh
-      nix
+      nixComponents.nix-cli
       coreutils
       findutils
       pixz
@@ -218,6 +223,7 @@ stdenv.mkDerivation (finalAttrs: {
       darcs
       gnused
       breezy
+      nix-eval-jobs
     ] ++ lib.optionals stdenv.isLinux [ rpm dpkg cdrkit ]
   );
 
@@ -232,7 +238,7 @@ stdenv.mkDerivation (finalAttrs: {
   shellHook = ''
     pushd $(git rev-parse --show-toplevel) >/dev/null
 
-    PATH=$(pwd)/src/hydra-evaluator:$(pwd)/src/script:$(pwd)/src/hydra-eval-jobs:$(pwd)/src/hydra-queue-runner:$PATH
+    PATH=$(pwd)/build/src/hydra-evaluator:$(pwd)/build/src/script:$(pwd)/build/src/hydra-queue-runner:$PATH
     PERL5LIB=$(pwd)/src/lib:$PERL5LIB
     export HYDRA_HOME="$(pwd)/src/"
     mkdir -p .hydra-data
@@ -263,12 +269,13 @@ stdenv.mkDerivation (finalAttrs: {
             --prefix PATH ':' $out/bin:$hydraPath \
             --set HYDRA_RELEASE ${version} \
             --set HYDRA_HOME $out/libexec/hydra \
-            --set NIX_RELEASE ${nix.name or "unknown"}
+            --set NIX_RELEASE ${nixComponents.nix-cli.name or "unknown"} \
+            --set NIX_EVAL_JOBS_RELEASE ${nix-eval-jobs.name or "unknown"}
     done
   '';
 
   dontStrip = true;
 
   meta.description = "Build of Hydra on ${stdenv.system}";
-  passthru = { inherit perlDeps nix; };
+  passthru = { inherit perlDeps; };
 })

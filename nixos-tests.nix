@@ -27,8 +27,7 @@ in
 {
 
   install = forEachSystem (system:
-    with import (nixpkgs + "/nixos/lib/testing-python.nix") { inherit system; };
-    simpleTest {
+    (import (nixpkgs + "/nixos/lib/testing-python.nix") { inherit system; }).simpleTest {
       name = "hydra-install";
       nodes.machine = hydraServer;
       testScript =
@@ -43,8 +42,7 @@ in
     });
 
   notifications = forEachSystem (system:
-    with import (nixpkgs + "/nixos/lib/testing-python.nix") { inherit system; };
-    simpleTest {
+    (import (nixpkgs + "/nixos/lib/testing-python.nix") { inherit system; }).simpleTest {
       name = "hydra-notifications";
       nodes.machine = {
         imports = [ hydraServer ];
@@ -56,7 +54,7 @@ in
         '';
         services.influxdb.enable = true;
       };
-      testScript = ''
+      testScript = { nodes, ... }: ''
         machine.wait_for_job("hydra-init")
 
         # Create an admin account and some other state.
@@ -87,7 +85,7 @@ in
 
         # Setup the project and jobset
         machine.succeed(
-            "su - hydra -c 'perl -I ${config.services.hydra-dev.package.perlDeps}/lib/perl5/site_perl ${./t/setup-notifications-jobset.pl}' >&2"
+            "su - hydra -c 'perl -I ${nodes.machine.services.hydra-dev.package.perlDeps}/lib/perl5/site_perl ${./t/setup-notifications-jobset.pl}' >&2"
         )
 
         # Wait until hydra has build the job and
@@ -101,9 +99,10 @@ in
     });
 
   gitea = forEachSystem (system:
-    let pkgs = nixpkgs.legacyPackages.${system}; in
-    with import (nixpkgs + "/nixos/lib/testing-python.nix") { inherit system; };
-    makeTest {
+    let
+      pkgs = nixpkgs.legacyPackages.${system};
+    in
+    (import (nixpkgs + "/nixos/lib/testing-python.nix") { inherit system; }).makeTest {
       name = "hydra-gitea";
       nodes.machine = { pkgs, ... }: {
         imports = [ hydraServer ];
