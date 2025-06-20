@@ -228,8 +228,8 @@ in
 
     nix.settings = {
       trusted-users = [ "hydra-queue-runner" ];
-      gc-keep-outputs = true;
-      gc-keep-derivations = true;
+      keep-outputs = true;
+      keep-derivations = true;
     };
 
     services.hydra-dev.extraConfig =
@@ -338,6 +338,7 @@ in
     systemd.services.hydra-queue-runner =
       { wantedBy = [ "multi-user.target" ];
         requires = [ "hydra-init.service" ];
+        wants = [ "network-online.target" ];
         after = [ "hydra-init.service" "network.target" "network-online.target" ];
         path = [ cfg.package pkgs.nettools pkgs.openssh pkgs.bzip2 config.nix.package ];
         restartTriggers = [ hydraConf ];
@@ -467,7 +468,7 @@ in
             elif [[ $compression == zstd ]]; then
               compression="zstd --rm"
             fi
-            find ${baseDir}/build-logs -type f -name "*.drv" -mtime +3 -size +0c | xargs -r "$compression" --force --quiet
+            find ${baseDir}/build-logs -ignore_readdir_race -type f -name "*.drv" -mtime +3 -size +0c | xargs -r "$compression" --force --quiet
           '';
         startAt = "Sun 01:45";
       };

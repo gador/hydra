@@ -1,6 +1,8 @@
 #include "state.hh"
 #include "hydra-build-result.hh"
-#include "globals.hh"
+#include <nix/store/globals.hh>
+#include <nix/store/parsed-derivations.hh>
+#include <nix/util/thread-pool.hh>
 
 #include <cstring>
 
@@ -37,15 +39,20 @@ void State::queueMonitorLoop(Connection & conn)
 
     auto destStore = getDestStore();
 
-    unsigned int lastBuildId = 0;
-
     bool quit = false;
     while (!quit) {
+        auto t_before_work = std::chrono::steady_clock::now();
+
         localStore->clearPathInfoCache();
 
-        bool done = getQueuedBuilds(conn, destStore, lastBuildId);
+        bool done = getQueuedBuilds(conn, destStore);
 
         if (buildOne && buildOneDone) quit = true;
+
+        auto t_after_work = std::chrono::steady_clock::now();
+
+        prom.queue_monitor_time_spent_running.Increment(
+            std::chrono::duration_cast<std::chrono::microseconds>(t_after_work - t_before_work).count());
 
         /* Sleep until we get notification from the database about an
            event. */
@@ -56,12 +63,10 @@ void State::queueMonitorLoop(Connection & conn)
             conn.get_notifs();
 
         if (auto lowestId = buildsAdded.get()) {
-            lastBuildId = std::min(lastBuildId, static_cast<unsigned>(std::stoul(*lowestId) - 1));
             printMsg(lvlTalkative, "got notification: new builds added to the queue");
         }
         if (buildsRestarted.get()) {
             printMsg(lvlTalkative, "got notification: builds restarted");
-            lastBuildId = 0; // check all builds
         }
         if (buildsCancelled.get() || buildsDeleted.get() || buildsBumped.get()) {
             printMsg(lvlTalkative, "got notification: builds cancelled or bumped");
@@ -71,6 +76,10 @@ void State::queueMonitorLoop(Connection & conn)
             printMsg(lvlTalkative, "got notification: jobset shares changed");
             processJobsetSharesChange(conn);
         }
+
+        auto t_after_sleep = std::chrono::steady_clock::now();
+        prom.queue_monitor_time_spent_waiting.Increment(
+            std::chrono::duration_cast<std::chrono::microseconds>(t_after_sleep - t_after_work).count());
     }
 
     exit(0);
@@ -84,19 +93,17 @@ struct PreviousFailure : public std::exception {
 
 
 bool State::getQueuedBuilds(Connection & conn,
-    ref<Store> destStore, unsigned int & lastBuildId)
+    ref<Store> destStore)
 {
     prom.queue_checks_started.Increment();
 
-    printInfo("checking the queue for builds > %d...", lastBuildId);
+    printInfo("checking the queue for builds...");
 
     /* Grab the queued builds from the database, but don't process
        them yet (since we don't want a long-running transaction). */
     std::vector<BuildID> newIDs;
-    std::map<BuildID, Build::ptr> newBuildsByID;
+    std::unordered_map<BuildID, Build::ptr> newBuildsByID;
     std::multimap<StorePath, BuildID> newBuildsByPath;
-
-    unsigned int newLastBuildId = lastBuildId;
 
     {
         pqxx::work txn(conn);
@@ -106,17 +113,12 @@ bool State::getQueuedBuilds(Connection & conn,
              "jobsets.name as jobset, job, drvPath, maxsilent, timeout, timestamp, "
              "globalPriority, priority from Builds "
              "inner join jobsets on builds.jobset_id = jobsets.id "
-             "where builds.id > $1 and finished = 0 order by globalPriority desc, builds.id",
-            lastBuildId);
+             "where finished = 0 order by globalPriority desc, random()");
 
         for (auto const & row : res) {
             auto builds_(builds.lock());
             BuildID id = row["id"].as<BuildID>();
             if (buildOne && id != buildOne) continue;
-            if (id > newLastBuildId) {
-                newLastBuildId = id;
-                prom.queue_max_id.Set(id);
-            }
             if (builds_->count(id)) continue;
 
             auto build = std::make_shared<Build>(
@@ -318,15 +320,13 @@ bool State::getQueuedBuilds(Connection & conn,
 
         /* Stop after a certain time to allow priority bumps to be
            processed. */
-        if (std::chrono::system_clock::now() > start + std::chrono::seconds(600)) {
+        if (std::chrono::system_clock::now() > start + std::chrono::seconds(60)) {
             prom.queue_checks_early_exits.Increment();
             break;
         }
     }
 
     prom.queue_checks_finished.Increment();
-
-    lastBuildId = newBuildsByID.empty() ? newLastBuildId : newBuildsByID.begin()->first - 1;
     return newBuildsByID.empty();
 }
 
@@ -405,6 +405,34 @@ void State::processQueueChange(Connection & conn)
 }
 
 
+std::map<DrvOutput, std::optional<StorePath>> State::getMissingRemotePaths(
+    ref<Store> destStore,
+    const std::map<DrvOutput, std::optional<StorePath>> & paths)
+{
+    Sync<std::map<DrvOutput, std::optional<StorePath>>> missing_;
+    ThreadPool tp;
+
+    for (auto & [output, maybeOutputPath] : paths) {
+        if (!maybeOutputPath) {
+            auto missing(missing_.lock());
+            missing->insert({output, maybeOutputPath});
+        } else {
+            tp.enqueue([&] {
+                if (!destStore->isValidPath(*maybeOutputPath)) {
+                    auto missing(missing_.lock());
+                    missing->insert({output, maybeOutputPath});
+                }
+            });
+        }
+    }
+
+    tp.process();
+
+    auto missing(missing_.lock());
+    return *missing;
+}
+
+
 Step::ptr State::createStep(ref<Store> destStore,
     Connection & conn, Build::ptr build, const StorePath & drvPath,
     Build::ptr referringBuild, Step::ptr referringStep, std::set<StorePath> & finishedDrvs,
@@ -463,14 +491,23 @@ Step::ptr State::createStep(ref<Store> destStore,
        it's not runnable yet, and other threads won't make it
        runnable while step->created == false. */
     step->drv = std::make_unique<Derivation>(localStore->readDerivation(drvPath));
-    step->parsedDrv = std::make_unique<ParsedDerivation>(drvPath, *step->drv);
+    {
+        auto parsedOpt = StructuredAttrs::tryParse(step->drv->env);
+        try {
+            step->drvOptions = std::make_unique<DerivationOptions>(
+                DerivationOptions::fromStructuredAttrs(step->drv->env, parsedOpt ? &*parsedOpt : nullptr));
+        } catch (Error & e) {
+            e.addTrace({}, "while parsing derivation '%s'", localStore->printStorePath(drvPath));
+            throw;
+        }
+    }
 
-    step->preferLocalBuild = step->parsedDrv->willBuildLocally(*localStore);
+    step->preferLocalBuild = step->drvOptions->willBuildLocally(*localStore, *step->drv);
     step->isDeterministic = getOr(step->drv->env, "isDetermistic", "0") == "1";
 
     step->systemType = step->drv->platform;
     {
-        StringSet features = step->requiredSystemFeatures = step->parsedDrv->getRequiredSystemFeatures();
+        StringSet features = step->requiredSystemFeatures = step->drvOptions->getRequiredSystemFeatures(*step->drv);
         if (step->preferLocalBuild)
             features.insert("local");
         if (!features.empty()) {
@@ -485,15 +522,14 @@ Step::ptr State::createStep(ref<Store> destStore,
 
     /* Are all outputs valid? */
     auto outputHashes = staticOutputHashes(*localStore, *(step->drv));
-    bool valid = true;
-    std::map<DrvOutput, std::optional<StorePath>> missing;
+    std::map<DrvOutput, std::optional<StorePath>> paths;
     for (auto & [outputName, maybeOutputPath] : destStore->queryPartialDerivationOutputMap(drvPath, &*localStore)) {
         auto outputHash = outputHashes.at(outputName);
-        if (maybeOutputPath && destStore->isValidPath(*maybeOutputPath))
-            continue;
-        valid = false;
-        missing.insert({{outputHash, outputName}, maybeOutputPath});
+        paths.insert({{outputHash, outputName}, maybeOutputPath});
     }
+
+    auto missing = getMissingRemotePaths(destStore, paths);
+    bool valid = missing.empty();
 
     /* Try to copy the missing paths from the local store or from
        substitutes. */
