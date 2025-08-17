@@ -313,11 +313,11 @@ unsigned int State::createBuildStep(pqxx::work & txn, time_t startTime, BuildID 
     if (r.affected_rows() == 0) goto restart;
 
     for (auto & [name, output] : getDestStore()->queryPartialDerivationOutputMap(step->drvPath, &*localStore))
-        txn.exec("insert into BuildStepOutputs (build, stepnr, name, path) values ($1, $2, $3, $4)",
+        txn.exec("insert into BuildStepOutputs (build, stepnr, name, path, contentAddressed) values ($1, $2, $3, $4, $5)",
             pqxx::params{buildId, stepNr, name,
             output
                 ? std::optional { localStore->printStorePath(*output)}
-                : std::nullopt}).no_rows();
+                : std::nullopt, step->drv->type().isCA()}).no_rows();
 
     if (status == bsBusy)
         txn.exec(fmt("notify step_started, '%d\t%d'", buildId, stepNr));
@@ -384,9 +384,9 @@ int State::createSubstitutionStep(pqxx::work & txn, time_t startTime, time_t sto
 
     if (r.affected_rows() == 0) goto restart;
 
-    txn.exec("insert into BuildStepOutputs (build, stepnr, name, path) values ($1, $2, $3, $4)",
+    txn.exec("insert into BuildStepOutputs (build, stepnr, name, path, contentAddressed) values ($1, $2, $3, $4, $5)",
          pqxx::params{build->id, stepNr, outputName,
-         localStore->printStorePath(storePath)}).no_rows();
+         localStore->printStorePath(storePath), drv.type().isCA()}).no_rows();
 
     return stepNr;
 }
